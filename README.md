@@ -6,8 +6,10 @@ This Worker builds a BGZF `tar.gz` from the two JPEG files in this directory and
 
 - `GET /tar.gz`: returns the BGZF `tar.gz` as-is, so the client expands a tar file.
 - `GET /entry/P2180294.jpg` and `GET /entry/P2180334.jpg`: mimics `cfw-fileup` targz entry download. It trims tar header/footer bytes from the first/final BGZF blocks, re-compresses those edge blocks, streams the middle BGZF blocks unchanged, and returns the result with `Content-Encoding: gzip`.
+- `GET /entry-fixed/P2180294.jpg` and `GET /entry-fixed/P2180334.jpg`: same as `/entry/*`, but pipes the response through `FixedLengthStream`.
 - `GET /entry-buffered/P2180294.jpg` and `GET /entry-buffered/P2180334.jpg`: same as `/entry/*`, but materializes the full response body before returning it.
 - `GET /entry-tar/P2180294.jpg` and `GET /entry-tar/P2180334.jpg`: trims to a single tar entry, appends a tar EOF block, and returns it as `Content-Type: image/jpeg` with `Content-Encoding: gzip`.
+- `GET /entry-tar-fixed/P2180294.jpg` and `GET /entry-tar-fixed/P2180334.jpg`: same as `/entry-tar/*`, but pipes the response through `FixedLengthStream`.
 - `GET /entry-tar-buffered/P2180294.jpg` and `GET /entry-tar-buffered/P2180334.jpg`: same as `/entry-tar/*`, but materializes the full response body before returning it.
 
 ## Commands
@@ -57,8 +59,15 @@ curl -sS http://127.0.0.1:8787/entry-buffered/P2180294.jpg -o /tmp/P2180294.entr
 gzip -cd /tmp/P2180294.entry-buffered.gz > /tmp/P2180294.entry-buffered.jpg
 cmp P2180294.jpg /tmp/P2180294.entry-buffered.jpg
 
+curl -sS http://127.0.0.1:8787/entry-fixed/P2180294.jpg -o /tmp/P2180294.entry-fixed.gz
+gzip -cd /tmp/P2180294.entry-fixed.gz > /tmp/P2180294.entry-fixed.jpg
+cmp P2180294.jpg /tmp/P2180294.entry-fixed.jpg
+
 curl -sS http://127.0.0.1:8787/entry-tar-buffered/P2180294.jpg -o /tmp/P2180294.entry-tar-buffered.gz
 tar -tzf /tmp/P2180294.entry-tar-buffered.gz
+
+curl -sS http://127.0.0.1:8787/entry-tar-fixed/P2180294.jpg -o /tmp/P2180294.entry-tar-fixed.gz
+tar -tzf /tmp/P2180294.entry-tar-fixed.gz
 ```
 
 For client-side `Content-Encoding` behavior:

@@ -19,7 +19,12 @@ type BgzfTrimRange = {
 	rEndOffset: number;
 };
 
-type EntryResponseMode = 'stream' | 'buffered';
+type EntryResponseMode = 'stream' | 'buffered' | 'fixed';
+
+type BgzfBody = {
+	body: ReadableStream<Uint8Array<ArrayBuffer>>;
+	contentLength: number;
+};
 
 function assetUrl(request: Request, path: string): URL {
 	const url = new URL(request.url);
@@ -113,7 +118,7 @@ async function createTrimmedBgzfStream(
 	archive: Uint8Array<ArrayBuffer>,
 	range: BgzfTrimRange,
 	extraBlocks: Uint8Array<ArrayBuffer>[] = [],
-): Promise<ReadableStream<Uint8Array<ArrayBuffer>>> {
+): Promise<BgzfBody> {
 	const isSingleBlock = range.aStart === range.aFinalStart;
 	const firstCompressed = archive.slice(range.aStart, range.aFirstEnd);
 	const firstDecompressed = await decompressGzipChunk(firstCompressed);
@@ -125,6 +130,7 @@ async function createTrimmedBgzfStream(
 	const intermediate = !isSingleBlock && range.aFirstEnd < range.aFinalStart
 		? createArchiveRangeResponse(archive, range.aFirstEnd, range.aFinalStart)
 		: null;
+	const intermediateLength = intermediate === null ? 0 : range.aFinalStart - range.aFirstEnd;
 
 	let lastBgzfBlock: Uint8Array<ArrayBuffer> | null = null;
 	if (!isSingleBlock && range.aFinalStart < range.aEnd) {
@@ -132,8 +138,13 @@ async function createTrimmedBgzfStream(
 		const lastDecompressed = await decompressGzipChunk(lastCompressed);
 		lastBgzfBlock = await createBgzfBlock(lastDecompressed.slice(0, lastDecompressed.length - range.rEndOffset));
 	}
+	const extraBlocksLength = extraBlocks.reduce((sum, block) => sum + block.byteLength, 0);
+	const contentLength = firstBgzfBlock.byteLength
+		+ intermediateLength
+		+ (lastBgzfBlock?.byteLength ?? 0)
+		+ extraBlocksLength;
 
-	return new ReadableStream<Uint8Array<ArrayBuffer>>({
+	const body = new ReadableStream<Uint8Array<ArrayBuffer>>({
 		async start(controller) {
 			try {
 				controller.enqueue(firstBgzfBlock);
@@ -146,18 +157,40 @@ async function createTrimmedBgzfStream(
 			}
 		},
 	});
+	return { body, contentLength };
 }
 
 async function materializeStreamIfBuffered(
-	stream: ReadableStream<Uint8Array<ArrayBuffer>>,
+	bgzfBody: BgzfBody,
 	mode: EntryResponseMode,
 ): Promise<ReadableStream<Uint8Array<ArrayBuffer>> | Uint8Array<ArrayBuffer>> {
-	return mode === 'buffered' ? readStream(stream) : stream;
+	return mode === 'buffered' ? readStream(bgzfBody.body) : bgzfBody.body;
+}
+
+function createFixedLengthBody(bgzfBody: BgzfBody): ReadableStream<Uint8Array<ArrayBuffer>> {
+	const fixed = new FixedLengthStream(bgzfBody.contentLength);
+	void bgzfBody.body.pipeTo(fixed.writable).catch((error: unknown) => {
+		console.error('FixedLengthStream pipe failed:', error);
+	});
+	return fixed.readable as ReadableStream<Uint8Array<ArrayBuffer>>;
+}
+
+function modeBody(
+	bgzfBody: BgzfBody,
+	mode: EntryResponseMode,
+): Promise<ReadableStream<Uint8Array<ArrayBuffer>> | Uint8Array<ArrayBuffer>> {
+	if (mode === 'fixed') return Promise.resolve(createFixedLengthBody(bgzfBody));
+	return materializeStreamIfBuffered(bgzfBody, mode);
+}
+
+function modeName(base: string, mode: EntryResponseMode): string {
+	if (mode === 'stream') return base;
+	return `${base}-${mode}`;
 }
 
 async function createEntryResponse(env: Env, request: Request, entry: TarGzIndexEntry, mode: EntryResponseMode): Promise<Response> {
 	const archive = await loadArchiveBytes(env, request);
-	const stream = await createTrimmedBgzfStream(archive, {
+	const bgzfBody = await createTrimmedBgzfStream(archive, {
 		aStart: entry.aStart,
 		aFirstEnd: entry.aFirstEnd,
 		aFinalStart: entry.aFinalStart,
@@ -165,14 +198,15 @@ async function createEntryResponse(env: Env, request: Request, entry: TarGzIndex
 		rStartOffset: entry.rStartOffset,
 		rEndOffset: entry.rEndOffset,
 	});
-	const body = await materializeStreamIfBuffered(stream, mode);
+	const body = await modeBody(bgzfBody, mode);
 
 	return new Response(body, {
 		headers: {
 			'Content-Type': entry.mimeType,
 			'Content-Disposition': attachment(entry.path),
 			'Content-Encoding': 'gzip',
-			'X-Repro-Mode': mode === 'buffered' ? 'entry-rebgzf-buffered' : 'entry-rebgzf',
+			'Content-Length': String(bgzfBody.contentLength),
+			'X-Repro-Mode': modeName('entry-rebgzf', mode),
 			'X-Source-Ranges': `${entry.aStart}-${entry.aFirstEnd},${entry.aFirstEnd}-${entry.aFinalStart},${entry.aFinalStart}-${entry.aEnd}`,
 		},
 		encodeBody: 'manual',
@@ -183,7 +217,7 @@ async function createEntryTarGzResponse(env: Env, request: Request, entry: TarGz
 	const archive = await loadArchiveBytes(env, request);
 	const tarEofBlock = await createBgzfBlock(new Uint8Array(1024));
 	const bgzfEofBlock = await createBgzfBlock(new Uint8Array(0));
-	const stream = await createTrimmedBgzfStream(archive, {
+	const bgzfBody = await createTrimmedBgzfStream(archive, {
 		aStart: entry.tarAStart,
 		aFirstEnd: entry.tarAFirstEnd,
 		aFinalStart: entry.tarAFinalStart,
@@ -191,14 +225,15 @@ async function createEntryTarGzResponse(env: Env, request: Request, entry: TarGz
 		rStartOffset: entry.tarStartOffset,
 		rEndOffset: entry.tarEndOffset,
 	}, [tarEofBlock, bgzfEofBlock]);
-	const body = await materializeStreamIfBuffered(stream, mode);
+	const body = await modeBody(bgzfBody, mode);
 
 	return new Response(body, {
 		headers: {
 			'Content-Type': entry.mimeType,
 			'Content-Disposition': attachment(`${entry.path}.tar`),
 			'Content-Encoding': 'gzip',
-			'X-Repro-Mode': mode === 'buffered' ? 'entry-tar-gz-buffered' : 'entry-tar-gz',
+			'Content-Length': String(bgzfBody.contentLength),
+			'X-Repro-Mode': modeName('entry-tar-gz', mode),
 			'X-Source-Ranges': `${entry.tarAStart}-${entry.tarAFirstEnd},${entry.tarAFirstEnd}-${entry.tarAFinalStart},${entry.tarAFinalStart}-${entry.tarAEnd}`,
 		},
 		encodeBody: 'manual',
@@ -225,8 +260,10 @@ async function createIndexResponse(env: Env, request: Request): Promise<Response
 		routes: {
 			tar: '/tar.gz',
 			entries: index.entries.map((entry) => `/entry/${encodeURIComponent(entry.path)}`),
+			fixedEntries: index.entries.map((entry) => `/entry-fixed/${encodeURIComponent(entry.path)}`),
 			bufferedEntries: index.entries.map((entry) => `/entry-buffered/${encodeURIComponent(entry.path)}`),
 			entryTarGz: index.entries.map((entry) => `/entry-tar/${encodeURIComponent(entry.path)}`),
+			fixedEntryTarGz: index.entries.map((entry) => `/entry-tar-fixed/${encodeURIComponent(entry.path)}`),
 			bufferedEntryTarGz: index.entries.map((entry) => `/entry-tar-buffered/${encodeURIComponent(entry.path)}`),
 		},
 		index,
@@ -246,6 +283,15 @@ export default {
 				return createTarResponse(env, request);
 			}
 
+			const fixedEntryTarMatch = /^\/entry-tar-fixed\/(.+)$/.exec(url.pathname);
+			if (fixedEntryTarMatch !== null) {
+				const requestedPath = decodeURIComponent(fixedEntryTarMatch[1]);
+				const index = await loadIndex(env, request);
+				const entry = index.entries.find((item) => item.path === requestedPath);
+				if (entry === undefined) return new Response('entry not found\n', { status: 404 });
+				return createEntryTarGzResponse(env, request, entry, 'fixed');
+			}
+
 			const bufferedEntryTarMatch = /^\/entry-tar-buffered\/(.+)$/.exec(url.pathname);
 			if (bufferedEntryTarMatch !== null) {
 				const requestedPath = decodeURIComponent(bufferedEntryTarMatch[1]);
@@ -262,6 +308,15 @@ export default {
 				const entry = index.entries.find((item) => item.path === requestedPath);
 				if (entry === undefined) return new Response('entry not found\n', { status: 404 });
 				return createEntryTarGzResponse(env, request, entry, 'stream');
+			}
+
+			const fixedEntryMatch = /^\/entry-fixed\/(.+)$/.exec(url.pathname);
+			if (fixedEntryMatch !== null) {
+				const requestedPath = decodeURIComponent(fixedEntryMatch[1]);
+				const index = await loadIndex(env, request);
+				const entry = index.entries.find((item) => item.path === requestedPath);
+				if (entry === undefined) return new Response('entry not found\n', { status: 404 });
+				return createEntryResponse(env, request, entry, 'fixed');
 			}
 
 			const bufferedEntryMatch = /^\/entry-buffered\/(.+)$/.exec(url.pathname);
