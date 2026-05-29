@@ -1,0 +1,17 @@
+{
+  "name": "cfw-bgzf",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-fixture.mjs",
+    "dev": "pnpm run build && wrangler dev",
+    "deploy": "pnpm run build && wrangler deploy",
+    "check": "pnpm exec tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260528.0",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.92.0"
+  }
+}
